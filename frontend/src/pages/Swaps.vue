@@ -1,7 +1,7 @@
 <template>
   <div>
     <h1 class="brand">对调</h1>
-    <p class="muted">先生成周表，再填写两格对调（day + task_id）</p>
+    <p class="muted">先生成周表，再填写两格对调（day + task_id）；涉及异常格的申请/确认都会失败且不落成功行</p>
     <div class="week-card" style="margin-bottom:12px">
       <label>A day <input type="number" v-model.number="form.a_day" /></label>
       <label>A task_id <input type="number" v-model.number="form.a_task" /></label>
@@ -13,7 +13,7 @@
     <ul class="list">
       <li v-for="s in rows" :key="s.id">
         #{{ s.id }} D{{ s.a_day }}/T{{ s.a_task }} ↔ D{{ s.b_day }}/T{{ s.b_task }}
-        <span class="chip" :class="{ coral: s.status==='pending' }">{{ s.status }}</span>
+        <span class="chip" :class="{ coral: s.status==='pending', bad: s.status==='failed' }">{{ s.status }}</span>
         <button v-if="s.status==='pending'" style="margin-left:8px" @click="confirm(s.id)">确认改表</button>
       </li>
     </ul>

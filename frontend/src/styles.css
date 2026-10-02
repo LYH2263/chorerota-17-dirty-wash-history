@@ -49,3 +49,6 @@ input, select, textarea {
 .list { padding: 0; margin: 0; }
 .muted { color: var(--muted); font-size: 13px; }
 .err { color: #b33a2c; }
+.chip.bad { background: #f8d7da; color: #842029; font-weight: 600; }
+.cell.anomaly { border-left: 3px solid #b33a2c; padding-left: 4px; border-radius: 4px; }
+button.warn { background: #b33a2c; }
