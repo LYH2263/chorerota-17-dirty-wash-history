@@ -1,7 +1,7 @@
 <template>
   <div>
     <h1 class="brand">对调</h1>
-    <p class="muted">先生成周表，再填写两格对调（day + task_id）</p>
+    <p class="muted">先生成周表，再填写两格对调（day + task_id）；涉及 ⚠ 异常格的申请/确认会被拒绝</p>
     <div class="week-card" style="margin-bottom:12px">
       <label>A day <input type="number" v-model.number="form.a_day" /></label>
       <label>A task_id <input type="number" v-model.number="form.a_task" /></label>

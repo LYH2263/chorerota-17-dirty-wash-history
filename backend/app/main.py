@@ -1,12 +1,11 @@
-import json
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from app import seed
 from app.db import connect
-from app.engines.rota import build_week_slots, swap_legal, apply_swap
+from app.modules import dirty_roster, clean_generate, current_backwash, history_backwash, swap_guard
 
-app = FastAPI(title="Chorerota", version="0.1.0")
+app = FastAPI(title="Chorerota", version="0.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.on_event("startup")
@@ -15,9 +14,11 @@ def _startup(): seed.init_db()
 @app.get("/api/health")
 def health(): return {"ok": True, "project": "chorerota"}
 
+# ---- 列表路：dirty / 负权项照常展示，附资格标注 ----
+
 @app.get("/api/members")
 def list_members():
-    c = connect(); rows = [dict(r) for r in c.execute("SELECT * FROM members")]; c.close(); return rows
+    c = connect(); rows = dirty_roster.list_members(c); c.close(); return rows
 
 @app.post("/api/members")
 def add_member(body: dict):
@@ -28,7 +29,7 @@ def add_member(body: dict):
 
 @app.get("/api/tasks")
 def list_tasks():
-    c = connect(); rows = [dict(r) for r in c.execute("SELECT * FROM tasks")]; c.close(); return rows
+    c = connect(); rows = dirty_roster.list_tasks(c); c.close(); return rows
 
 @app.post("/api/tasks")
 def add_task(body: dict):
@@ -37,6 +38,77 @@ def add_task(body: dict):
                     (body.get("title","任务"), int(body.get("weight",1)), body.get("data_quality","clean")))
     c.commit(); tid = cur.lastrowid; c.close(); return {"id": tid}
 
+# ---- 实体质量写入：转不可排时 latch 历史格异常标记 ----
+
+@app.put("/api/members/{member_id}")
+def put_member(member_id: int, body: dict):
+    c = connect()
+    row = dirty_roster.update_member(c, member_id, body)
+    if row is None: c.close(); raise HTTPException(404, "member not found")
+    flagged = history_backwash.flag_cells_for_member(c, member_id)
+    c.commit(); c.close()
+    return {"member": row, "flagged_cells": flagged}
+
+@app.put("/api/tasks/{task_id}")
+def put_task(task_id: int, body: dict):
+    c = connect()
+    row = dirty_roster.update_task(c, task_id, body)
+    if row is None: c.close(); raise HTTPException(404, "task not found")
+    flagged = history_backwash.flag_cells_for_task(c, task_id)
+    c.commit(); c.close()
+    return {"task": row, "flagged_cells": flagged}
+
+# ---- 现行回洗：只洗净实体，仅新生成可纳入，历史格一律不动 ----
+
+class WashMemberBody(BaseModel):
+    data_quality: str | None = None
+    active: int | None = None
+
+@app.post("/api/members/{member_id}/wash")
+def wash_member(member_id: int, body: WashMemberBody = WashMemberBody()):
+    c = connect()
+    try:
+        out = current_backwash.wash_member(c, member_id, body.data_quality, body.active)
+    except current_backwash.WashError as e:
+        c.close(); raise HTTPException(404, str(e))
+    c.commit(); c.close(); return out
+
+class WashTaskBody(BaseModel):
+    data_quality: str | None = None
+    weight: int | None = None
+
+@app.post("/api/tasks/{task_id}/wash")
+def wash_task(task_id: int, body: WashTaskBody = WashTaskBody()):
+    c = connect()
+    try:
+        out = current_backwash.wash_task(c, task_id, body.data_quality, body.weight)
+    except current_backwash.WashError as e:
+        c.close(); raise HTTPException(404, str(e))
+    c.commit(); c.close(); return out
+
+# ---- 历史格回洗：显式逐格改写；不改写的格子保持只读异常 ----
+
+class CellWashBody(BaseModel):
+    member_id: int | None = None
+    task_id: int | None = None
+
+@app.post("/api/assignments/{assignment_id}/wash")
+def wash_cell(assignment_id: int, body: CellWashBody = CellWashBody()):
+    c = connect()
+    try:
+        out = history_backwash.rewrite_cell(c, assignment_id, body.member_id, body.task_id)
+    except history_backwash.WashError as e:
+        c.close(); raise HTTPException(400, str(e))
+    c.commit(); c.close(); return out
+
+@app.get("/api/backwash-log")
+def backwash_log():
+    c = connect()
+    rows = [dict(r) for r in c.execute("SELECT * FROM backwash_log ORDER BY id DESC")]
+    c.close(); return rows
+
+# ---- 看板：异常格保持标记展示 ----
+
 @app.get("/api/weeks")
 def list_weeks():
     c = connect(); rows = [dict(r) for r in c.execute("SELECT * FROM weeks")]; c.close(); return rows
@@ -44,16 +116,12 @@ def list_weeks():
 @app.get("/api/weeks/{week_id}/board")
 def week_board(week_id: int):
     c = connect()
-    week = c.execute("SELECT * FROM weeks WHERE id=?", (week_id,)).fetchone()
-    if not week: c.close(); raise HTTPException(404, "week not found")
-    assigns = [dict(r) for r in c.execute("SELECT * FROM assignments WHERE week_id=?", (week_id,))]
-    members = {r["id"]: r["name"] for r in c.execute("SELECT id,name FROM members")}
-    tasks = {r["id"]: r["title"] for r in c.execute("SELECT id,title FROM tasks")}
+    board = dirty_roster.week_board(c, week_id)
     c.close()
-    for a in assigns:
-        a["member_name"] = members.get(a["member_id"], "?")
-        a["task_title"] = tasks.get(a["task_id"], "?")
-    return {"week": dict(week), "assignments": assigns}
+    if board is None: raise HTTPException(404, "week not found")
+    return board
+
+# ---- 生成路：只引用 clean 资格集 ----
 
 class GenBody(BaseModel):
     days: int = 7
@@ -61,18 +129,11 @@ class GenBody(BaseModel):
 @app.post("/api/weeks/{week_id}/generate")
 def generate(week_id: int, body: GenBody = GenBody()):
     c = connect()
-    week = c.execute("SELECT * FROM weeks WHERE id=?", (week_id,)).fetchone()
-    if not week: c.close(); raise HTTPException(404, "week not found")
-    mids = [r["id"] for r in c.execute("SELECT id FROM members WHERE active=1 AND data_quality='clean' ORDER BY id")]
-    tids = [r["id"] for r in c.execute("SELECT id FROM tasks WHERE data_quality='clean' AND weight>0 ORDER BY id")]
-    slots = build_week_slots(mids, tids, days=body.days)
-    c.execute("DELETE FROM assignments WHERE week_id=?", (week_id,))
-    for s in slots:
-        c.execute("INSERT INTO assignments(week_id,day,task_id,member_id) VALUES (?,?,?,?)",
-                  (week_id, s["day"], s["task_id"], s["member_id"]))
-    c.execute("UPDATE weeks SET status='ready' WHERE id=?", (week_id,))
-    c.commit(); c.close()
-    return {"count": len(slots), "slots": slots}
+    out = clean_generate.generate_week(c, week_id, days=body.days)
+    if out is None: c.close(); raise HTTPException(404, "week not found")
+    c.commit(); c.close(); return out
+
+# ---- 对调路：异常格申请/确认双关口拦截 ----
 
 class SwapBody(BaseModel):
     a_day: int; a_task: int; b_day: int; b_task: int; note: str = ""
@@ -80,15 +141,11 @@ class SwapBody(BaseModel):
 @app.post("/api/weeks/{week_id}/swaps")
 def request_swap(week_id: int, body: SwapBody):
     c = connect()
-    assigns = [dict(r) for r in c.execute("SELECT day,task_id,member_id FROM assignments WHERE week_id=?", (week_id,))]
-    check = swap_legal(assigns, body.a_day, body.a_task, body.b_day, body.b_task)
-    if not check["ok"]:
-        c.close(); raise HTTPException(400, check["reason"])
-    cur = c.execute(
-        "INSERT INTO swap_requests(week_id,a_day,a_task,b_day,b_task,status,note) VALUES (?,?,?,?,?,?,?)",
-        (week_id, body.a_day, body.a_task, body.b_day, body.b_task, "pending", body.note))
-    c.commit(); sid = cur.lastrowid; c.close()
-    return {"id": sid, "status": "pending", **check}
+    try:
+        out = swap_guard.request_swap(c, week_id, body.a_day, body.a_task, body.b_day, body.b_task, body.note)
+    except swap_guard.SwapBlocked as e:
+        c.close(); raise HTTPException(400, str(e))
+    c.commit(); c.close(); return out
 
 @app.get("/api/swaps")
 def list_swaps():
@@ -97,22 +154,13 @@ def list_swaps():
 @app.post("/api/swaps/{swap_id}/confirm")
 def confirm_swap(swap_id: int):
     c = connect()
-    sw = c.execute("SELECT * FROM swap_requests WHERE id=?", (swap_id,)).fetchone()
-    if not sw: c.close(); raise HTTPException(404, "swap not found")
-    if sw["status"] != "pending":
-        c.close(); raise HTTPException(400, "not_pending")
-    assigns = [dict(r) for r in c.execute(
-        "SELECT id,day,task_id,member_id FROM assignments WHERE week_id=?", (sw["week_id"],))]
-    slots = [{"day": a["day"], "task_id": a["task_id"], "member_id": a["member_id"]} for a in assigns]
     try:
-        new_slots = apply_swap(slots, sw["a_day"], sw["a_task"], sw["b_day"], sw["b_task"])
-    except ValueError as e:
+        out = swap_guard.confirm_swap(c, swap_id)
+    except swap_guard.SwapBlocked as e:
         c.close(); raise HTTPException(400, str(e))
-    for a, s in zip(assigns, new_slots):
-        c.execute("UPDATE assignments SET member_id=? WHERE id=?", (s["member_id"], a["id"]))
-    c.execute("UPDATE swap_requests SET status='confirmed' WHERE id=?", (swap_id,))
-    c.commit(); c.close()
-    return {"ok": True, "swap_id": swap_id}
+    c.commit(); c.close(); return out
+
+# ---- 设置 ----
 
 @app.get("/api/settings")
 def get_settings():
